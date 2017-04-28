@@ -220,6 +220,13 @@ exports.getClientChannel = client.getClientChannel;
  */
 exports.waitForClientReady = client.waitForClientReady;
 
+exports.InterceptorProvider = client.InterceptorProvider;
+exports.StatusBuilder = client.StatusBuilder;
+exports.ListenerBuilder = client.ListenerBuilder;
+exports.RequesterBuilder = client.RequesterBuilder;
+exports.InterceptingCall = client.InterceptingCall;
+exports.MethodType = client.MethodType;
+
 exports.closeClient = function closeClient(client_obj) {
   client.getClientChannel(client_obj).close();
 };

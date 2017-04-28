@@ -1,9 +1,12 @@
 {
-  "name": "grpc",
-  "version": "1.2.0-dev",
+  "name": "nf-grpc",
+  "version": "1.2.0-nf.0",
   "author": "Google Inc.",
   "description": "gRPC Library for Node",
   "homepage": "http://www.grpc.io/",
+  "publishConfig": {
+    "registry": "http://artifacts.netflix.com/api/npm/npm-netflix"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/grpc/grpc.git"

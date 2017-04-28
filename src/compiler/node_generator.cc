@@ -215,7 +215,7 @@ void PrintService(const ServiceDescriptor *service, Printer *out) {
 }
 
 void PrintImports(const FileDescriptor *file, Printer *out) {
-  out->Print("var grpc = require('grpc');\n");
+  out->Print("var grpc = require('nf-grpc');\n");
   if (file->message_type_count() > 0) {
     grpc::string file_path =
         GetRelativePath(file->name(), GetJSMessageFilename(file->name()));

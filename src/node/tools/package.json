@@ -1,12 +1,15 @@
 {
-  "name": "grpc-tools",
-  "version": "1.2.0-dev",
+  "name": "nf-grpc-tools",
+  "version": "1.2.0-nf.0",
   "author": "Google Inc.",
   "description": "Tools for developing with gRPC on Node.js",
   "homepage": "http://www.grpc.io/",
   "repository": {
     "type": "git",
     "url": "https://github.com/grpc/grpc.git"
+  },
+  "publishConfig": {
+    "registry": "http://artifacts.netflix.com/api/npm/npm-netflix"
   },
   "bugs": "https://github.com/grpc/grpc/issues",
   "contributors": [
@@ -25,8 +28,8 @@
   "bundledDependencies": ["node-pre-gyp"],
   "binary": {
     "module_name": "grpc_tools",
-    "host": "https://storage.googleapis.com/",
-    "remote_path": "grpc-precompiled-binaries/node/{name}/v{version}",
+    "host": "https://s3.amazonaws.com/",
+    "remote_path": "us-east-1.netflix.s3.genpop.test/dliu/grpc-precompiled-binaries/node/grpc_tools/v1.1.2/",
     "package_name": "{platform}-{arch}.tar.gz",
     "module_path": "bin"
   },

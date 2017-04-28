@@ -52,6 +52,8 @@
 var _ = require('lodash');
 var arguejs = require('arguejs');
 
+var client_interceptors = require('./client_interceptors');
+
 var grpc = require('./grpc_extension');
 
 var common = require('./common');
@@ -82,9 +84,7 @@ function ClientWritableStream(call, serialize) {
   this.call = call;
   this.serialize = common.wrapIgnoreNull(serialize);
   this.on('finish', function() {
-    var batch = {};
-    batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
-    call.startBatch(batch, function() {});
+    call.halfClose();
   });
 }
 
@@ -98,32 +98,11 @@ function ClientWritableStream(call, serialize) {
  */
 function _write(chunk, encoding, callback) {
   /* jshint validthis: true */
-  var batch = {};
-  var message;
-  try {
-    message = this.serialize(chunk);
-  } catch (e) {
-    /* Sending this error to the server and emitting it immediately on the
-       client may put the call in a slightly weird state on the client side,
-       but passing an object that causes a serialization failure is a misuse
-       of the API anyway, so that's OK. The primary purpose here is to give the
-       programmer a useful error and to stop the stream properly */
-    this.call.cancelWithStatus(grpc.status.INTERNAL, "Serialization failure");
-    callback(e);
-  }
-  if (_.isFinite(encoding)) {
-    /* Attach the encoding if it is a finite number. This is the closest we
-     * can get to checking that it is valid flags */
-    message.grpcWriteFlags = encoding;
-  }
-  batch[grpc.opType.SEND_MESSAGE] = message;
-  this.call.startBatch(batch, function(err, event) {
-    if (err) {
-      // Something has gone wrong. Stop writing by failing to call callback
-      return;
-    }
-    callback();
-  });
+  var context = {
+    encoding: encoding,
+    callback: callback
+  };
+  this.call.sendMessageWithContext(context, chunk);
 }
 
 ClientWritableStream.prototype._write = _write;
@@ -222,42 +201,15 @@ function _read(size) {
    * the read queue and starts reading again if applicable
    * @param {grpc.Event} event READ event object
    */
-  function readCallback(err, event) {
-    if (err) {
-      // Something has gone wrong. Stop reading and wait for status
-      self.finished = true;
-      self._readsDone();
-      return;
-    }
-    var data = event.read;
-    var deserialized;
-    try {
-      deserialized = self.deserialize(data);
-    } catch (e) {
-      self._readsDone({code: grpc.status.INTERNAL,
-                       details: 'Failed to parse server response'});
-      return;
-    }
-    if (data === null) {
-      self._readsDone();
-      return;
-    }
-    if (self.push(deserialized) && data !== null) {
-      var read_batch = {};
-      read_batch[grpc.opType.RECV_MESSAGE] = true;
-      self.call.startBatch(read_batch, readCallback);
-    } else {
-      self.reading = false;
-    }
-  }
   if (self.finished) {
     self.push(null);
   } else {
     if (!self.reading) {
       self.reading = true;
-      var read_batch = {};
-      read_batch[grpc.opType.RECV_MESSAGE] = true;
-      self.call.startBatch(read_batch, readCallback);
+      var context = {
+        stream: self
+      };
+      self.call.recvMessageWithContext(context);
     }
   }
 }
@@ -286,9 +238,7 @@ function ClientDuplexStream(call, serialize, deserialize) {
   /* Status received from the server. */
   this.received_status = null;
   this.on('finish', function() {
-    var batch = {};
-    batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
-    call.startBatch(batch, function() {});
+    call.halfClose();
   });
 }
 
@@ -323,45 +273,459 @@ ClientReadableStream.prototype.getPeer = getPeer;
 ClientWritableStream.prototype.getPeer = getPeer;
 ClientDuplexStream.prototype.getPeer = getPeer;
 
+var MethodType = {
+  UNARY: 0,
+  CLIENT_STREAMING: 1,
+  SERVER_STREAMING: 2,
+  BIDI_STREAMING: 3
+};
+
+exports.MethodType = MethodType;
+
+/**
+ * A container for the useful properties of a gRPC method.
+ * @param {string} name
+ * @param {string} service_name
+ * @param {string} path
+ * @param {MethodType} method_type
+ * @param {Function} serialize
+ * @param {Function} deserialize
+ * @constructor
+ */
+function MethodDescriptor(name, service_name, path, method_type, serialize,
+                          deserialize) {
+  this.name = name;
+  this.service_name = service_name;
+  this.path = path;
+  this.method_type = method_type;
+  this.serialize = serialize;
+  this.deserialize = deserialize;
+}
+
+exports.MethodDescriptor = MethodDescriptor;
+
 /**
  * Get a call object built with the provided options. Keys for options are
  * 'deadline', which takes a date or number, and 'host', which takes a string
  * and overrides the hostname to connect to.
+ * @param {grpc.Channel} channel
  * @param {Object} options Options map.
  */
-function getCall(channel, method, options) {
+function getCall(channel, options) {
   var deadline;
   var host;
   var parent;
   var propagate_flags;
   var credentials;
+  var method_descriptor;
   if (options) {
     deadline = options.deadline;
     host = options.host;
     parent = _.get(options, 'parent.call');
     propagate_flags = options.propagate_flags;
     credentials = options.credentials;
+    method_descriptor = options.method_descriptor;
   }
   if (deadline === undefined) {
     deadline = Infinity;
   }
-  var call = new grpc.Call(channel, method, deadline, host,
-                           parent, propagate_flags);
+  var call = new grpc.Call(channel, method_descriptor.path, deadline, host,
+    parent, propagate_flags);
   if (credentials) {
     call.setCredentials(credentials);
   }
   return call;
 }
 
+var BatchType = {
+  UNARY: 0,
+  METADATA: 1,
+  CLOSE: 2,
+  SEND_STREAMING: 3,
+  RECV_STREAMING: 4,
+  STATUS: 5,
+  SEND_SYNC: 6,
+  RECV_SYNC: 7
+};
+
+function _getInterceptingCall(call_constructor, interceptors, batch_registry,
+                              options) {
+  var interceptor_base = client_interceptors.getBaseInterceptor(
+    call_constructor, batch_registry);
+  var interceptor_top = client_interceptors.getInboundBatcher(batch_registry);
+  var all_interceptors = _.concat(interceptor_top, interceptors,
+    interceptor_base);
+  return client_interceptors.getInterceptingCall(all_interceptors, options);
+}
+
+function _registerUnaryBatch(emitter, batch_registry, options, callback) {
+  var join_top = function(batch) {
+    var metadata = batch[grpc.opType.RECV_INITIAL_METADATA];
+    var message = batch[grpc.opType.RECV_MESSAGE];
+    var status = batch[grpc.opType.RECV_STATUS_ON_CLIENT];
+    var error;
+    emitter.emit('metadata', metadata);
+    if (status.code !== grpc.status.OK) {
+      error = new Error(status.details);
+      error.code = status.code;
+      error.metadata = status.metadata;
+      callback(error);
+    } else {
+      callback(null, message);
+    }
+    emitter.emit('status', status);
+  };
+
+  var join_base = function(batch, call, listener) {
+    var raw_message = batch[grpc.opType.SEND_MESSAGE];
+    var message = options.method_descriptor.serialize(raw_message);
+    if (options) {
+      message.grpcWriteFlags = options.flags;
+    }
+    var raw_metadata = batch[grpc.opType.SEND_INITIAL_METADATA];
+    var metadata = raw_metadata._getCoreRepresentation();
+    batch[grpc.opType.SEND_MESSAGE] = message;
+    batch[grpc.opType.SEND_INITIAL_METADATA] = metadata;
+    call.startBatch(batch, function(err, response) {
+      response.status.metadata = Metadata._fromCoreRepresentation(
+        response.status.metadata);
+      var status = response.status;
+      var deserialized;
+      if (status.code === grpc.status.OK) {
+        if (err) {
+          // Got a batch error, but OK status. Something went wrong
+          callback(err);
+          return;
+        } else {
+          try {
+            deserialized = options.method_descriptor.deserialize(response.read);
+          } catch (e) {
+            /* Change status to indicate bad server response. This will result
+             * in passing an error to the callback */
+            status = {
+              code: grpc.status.INTERNAL,
+              details: 'Failed to parse server response'
+            };
+          }
+        }
+      }
+      response.metadata = Metadata._fromCoreRepresentation(response.metadata);
+      listener.onReceiveMetadata(response.metadata);
+      listener.onReceiveMessage(deserialized);
+      listener.onReceiveStatus(status);
+    });
+  };
+
+  var batch_ops = [
+    grpc.opType.SEND_INITIAL_METADATA,
+    grpc.opType.SEND_MESSAGE,
+    grpc.opType.SEND_CLOSE_FROM_CLIENT,
+    grpc.opType.RECV_INITIAL_METADATA,
+    grpc.opType.RECV_MESSAGE,
+    grpc.opType.RECV_STATUS_ON_CLIENT
+  ];
+
+  batch_registry.add('unary', batch_ops, join_base, join_top);
+}
+
+function _registerMetadataBatch(emitter, batch_registry) {
+
+  var join_top = function(batch) {
+    var metadata = batch[grpc.opType.RECV_INITIAL_METADATA];
+    emitter.emit('metadata', metadata);
+  };
+
+  var join_base = function(batch, call, listener) {
+    var metadata_batch = {};
+    var raw_metadata = batch[grpc.opType.SEND_INITIAL_METADATA];
+    var metadata = raw_metadata._getCoreRepresentation();
+    metadata_batch[grpc.opType.SEND_INITIAL_METADATA] = metadata;
+    metadata_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
+    call.startBatch(metadata_batch, function(err, response) {
+      if (err) {
+        // The call has stopped for some reason. A non-OK status will arrive
+        // in the other batch.
+        return;
+      }
+      response.metadata = Metadata._fromCoreRepresentation(response.metadata);
+      listener.onReceiveMetadata(response.metadata);
+    });
+  };
+
+  var batch_ops = [
+    grpc.opType.SEND_INITIAL_METADATA,
+    grpc.opType.RECV_INITIAL_METADATA
+  ];
+
+  batch_registry.add('metadata', batch_ops, join_base, join_top);
+}
+
+function _registerRecvSync(emitter, batch_registry, options, callback) {
+  var join_top = function(batch) {
+    var message = batch[grpc.opType.RECV_MESSAGE];
+    var status = batch[grpc.opType.RECV_STATUS_ON_CLIENT];
+    var error;
+    if (status.code !== grpc.status.OK) {
+      error = new Error(status.details);
+      error.code = status.code;
+      error.metadata = status.metadata;
+      callback(error);
+    } else {
+      callback(null, message);
+    }
+    emitter.emit('status', status);
+  };
+
+  var join_base = function(batch, call, listener) {
+    var client_batch = {};
+    client_batch[grpc.opType.RECV_MESSAGE] = true;
+    client_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
+    call.startBatch(client_batch, function(err, response) {
+      response.status.metadata = Metadata._fromCoreRepresentation(
+        response.status.metadata);
+      var status = response.status;
+      var deserialized;
+      if (status.code === grpc.status.OK) {
+        if (err) {
+          // Got a batch error, but OK status. Something went wrong
+          callback(err);
+          return;
+        } else {
+          try {
+            deserialized = options.method_descriptor.deserialize(response.read);
+          } catch (e) {
+            /* Change status to indicate bad server response. This will result
+             * in passing an error to the callback */
+            status = {
+              code: grpc.status.INTERNAL,
+              details: 'Failed to parse server response'
+            };
+          }
+        }
+      }
+      listener.onReceiveMessage(deserialized);
+      listener.onReceiveStatus(status);
+    });
+  };
+
+  var batch_ops = [
+    grpc.opType.RECV_MESSAGE,
+    grpc.opType.RECV_STATUS_ON_CLIENT
+  ];
+  batch_registry.add('recv_sync', batch_ops, join_base, join_top);
+}
+
+function _registerSendStreaming(emitter, batch_registry, options) {
+
+  var join_base = function(batch, call, listener, context) {
+    var message;
+    var chunk = batch[grpc.opType.SEND_MESSAGE];
+    var callback = context.callback;
+    var encoding = context.encoding;
+    try {
+      message = options.method_descriptor.serialize(chunk);
+    } catch (e) {
+      /* Sending this error to the server and emitting it immediately on the
+       client may put the call in a slightly weird state on the client side,
+       but passing an object that causes a serialization failure is a misuse
+       of the API anyway, so that's OK. The primary purpose here is to give the
+       programmer a useful error and to stop the stream properly */
+      call.cancelWithStatus(grpc.status.INTERNAL, 'Serialization failure');
+      if (callback) {
+        callback(e);
+      }
+    }
+    if (_.isFinite(encoding)) {
+      /* Attach the encoding if it is a finite number. This is the closest we
+       * can get to checking that it is valid flags */
+      message.grpcWriteFlags = encoding;
+    } else {
+      message.grpcWriteFlags = options.flags;
+    }
+    var streaming_batch = {};
+    streaming_batch[grpc.opType.SEND_MESSAGE] = message;
+    call.startBatch(streaming_batch, function(err, event) {
+      if (err) {
+        // Something has gone wrong. Stop writing by failing to call callback
+        return;
+      }
+      if (callback) {
+        callback();
+      }
+    });
+  };
+  var batch_ops = [
+    grpc.opType.SEND_MESSAGE
+  ];
+
+  batch_registry.add('send_streaming', batch_ops, join_base);
+}
+
+function _registerClose(emitter, batch_registry) {
+  var join_base = function(batch, call) {
+    var end_batch = {};
+    end_batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
+    call.startBatch(end_batch, function() {});
+  };
+
+  var batch_ops = [
+    grpc.opType.SEND_CLOSE_FROM_CLIENT
+  ];
+
+  batch_registry.add('close', batch_ops, join_base);
+}
+
+function _registerSendSync(emitter, batch_registry, options) {
+
+  var join_top = function(batch) {
+    var metadata = batch[grpc.opType.RECV_INITIAL_METADATA];
+    emitter.emit('metadata', metadata);
+  };
+
+  var join_base = function(batch, call, listener) {
+    var start_batch = {};
+    var raw_message = batch[grpc.opType.SEND_MESSAGE];
+    var message = options.method_descriptor.serialize(raw_message);
+    if (options) {
+      message.grpcWriteFlags = options.flags;
+    }
+    var raw_metadata = batch[grpc.opType.SEND_INITIAL_METADATA];
+    var metadata = raw_metadata._getCoreRepresentation();
+    start_batch[grpc.opType.SEND_INITIAL_METADATA] = metadata;
+    start_batch[grpc.opType.SEND_MESSAGE] = message;
+    start_batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
+    start_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
+    call.startBatch(start_batch, function(err, response) {
+      if (err) {
+        // The call has stopped for some reason. A non-OK status will arrive
+        // in the other batch.
+        return;
+      }
+      response.metadata = Metadata._fromCoreRepresentation(response.metadata);
+      listener.onReceiveMetadata(response.metadata);
+    });
+  };
+
+  var batch_ops = [
+    grpc.opType.SEND_INITIAL_METADATA,
+    grpc.opType.RECV_INITIAL_METADATA,
+    grpc.opType.SEND_MESSAGE,
+    grpc.opType.SEND_CLOSE_FROM_CLIENT
+  ];
+
+  batch_registry.add('send_sync', batch_ops, join_base, join_top);
+}
+
+function _registerStatus(emitter, batch_registry) {
+  var join_top = function(batch) {
+    var status = batch[grpc.opType.RECV_STATUS_ON_CLIENT];
+    emitter._receiveStatus(status);
+  };
+
+  var join_base = function(batch, call, listener) {
+    var status_batch = {};
+    status_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
+    call.startBatch(status_batch, function(err, response) {
+      if (err) {
+        emitter.emit('error', err);
+        return;
+      }
+      response.status.metadata = Metadata._fromCoreRepresentation(
+        response.status.metadata);
+      listener.onReceiveStatus(response.status);
+    });
+  };
+
+  var batch_ops = [
+    grpc.opType.RECV_STATUS_ON_CLIENT
+  ];
+
+  batch_registry.add('status', batch_ops, join_base, join_top);
+}
+
+function _registerRecvStreaming(emitter, batch_registry, options) {
+  var getCallback = function(stream, call, listener) {
+    return function(err, response) {
+      if (err) {
+        // Something has gone wrong. Stop reading and wait for status
+        stream.finished = true;
+        stream._readsDone();
+        return;
+      }
+      var context = {
+        stream: stream,
+        call: call,
+        listener: listener
+      };
+      var data = response.read;
+      var deserialized;
+      try {
+        deserialized = options.method_descriptor.deserialize(data);
+      } catch (e) {
+        stream._readsDone({code: grpc.status.INTERNAL,
+          details: 'Failed to parse server response'});
+        return;
+      }
+      if (data === null) {
+        stream._readsDone();
+        return;
+      }
+      listener.recvMessageWithContext(context, deserialized);
+    };
+  };
+  var join_top = function(batch, context) {
+    var message = batch[grpc.opType.RECV_MESSAGE];
+    var stream_obj = context.stream;
+    var call = context.call;
+    var listener = context.listener;
+    if (stream_obj.push(message) && message !== null) {
+      var read_batch = {};
+      read_batch[grpc.opType.RECV_MESSAGE] = true;
+      call.startBatch(read_batch, getCallback(context.stream, call, listener));
+    } else {
+      stream_obj.reading = false;
+    }
+  };
+
+  var join_base = function(batch, call, listener, context) {
+    context.call = call;
+    context.listener = listener;
+    var read_batch = {};
+    read_batch[grpc.opType.RECV_MESSAGE] = true;
+    call.startBatch(read_batch, getCallback(context.stream, call, listener));
+  };
+
+  var batch_ops = [
+    grpc.opType.RECV_MESSAGE
+  ];
+
+  batch_registry.add('recv_streaming', batch_ops, join_base, join_top);
+}
+
+function _registerBatches(emitter, batch_registry, batch_types, options,
+                          callback) {
+  var actions = {};
+  actions[BatchType.UNARY] = _registerUnaryBatch;
+  actions[BatchType.METADATA] = _registerMetadataBatch;
+  actions[BatchType.RECV_SYNC] = _registerRecvSync;
+  actions[BatchType.SEND_STREAMING] = _registerSendStreaming;
+  actions[BatchType.CLOSE] = _registerClose;
+  actions[BatchType.SEND_SYNC] = _registerSendSync;
+  actions[BatchType.STATUS] = _registerStatus;
+  actions[BatchType.RECV_STREAMING] = _registerRecvStreaming;
+
+  _.each(batch_types, function(batch_type) {
+    actions[batch_type](emitter, batch_registry, options, callback);
+  });
+}
+
 /**
  * Get a function that can make unary requests to the specified method.
- * @param {string} method The name of the method to request
- * @param {function(*):Buffer} serialize The serialization function for inputs
- * @param {function(Buffer)} deserialize The deserialization function for
- *     outputs
+ * @param {MethodDescriptor} method_descriptor A container of method attributes
+ * creation of the request method
  * @return {Function} makeUnaryRequest
  */
-function makeUnaryRequestFunction(method, serialize, deserialize) {
+function makeUnaryRequestFunction(method_descriptor) {
   /**
    * Make a unary request with this method on the given channel with the given
    * argument, callback, etc.
@@ -381,65 +745,37 @@ function makeUnaryRequestFunction(method, serialize, deserialize) {
      * object. This allows for simple handling of optional arguments in the
      * middle of the argument list, and also provides type checking. */
     var args = arguejs({argument: null, metadata: [Metadata, new Metadata()],
-                        options: [Object], callback: Function}, arguments);
+      options: [Object, {}], callback: Function}, arguments);
     var emitter = new EventEmitter();
-    var call = getCall(this.$channel, method, args.options);
+    var constructor_interceptors = this[method_descriptor.name] ?
+      this[method_descriptor.name].interceptors :
+      null;
+    args.options.method_descriptor = method_descriptor;
+    var call_constructor = getCall.bind(null, this.$channel);
     metadata = args.metadata.clone();
+    var interceptors = client_interceptors.processInterceptorLayers(
+      args.options,
+      constructor_interceptors,
+      method_descriptor
+    );
+
+    var batch_registry = new client_interceptors.BatchRegistry();
+    var intercepting_call = _getInterceptingCall(call_constructor,
+      interceptors, batch_registry, args.options);
+    _registerBatches(emitter, batch_registry, [BatchType.UNARY], args.options,
+      args.callback);
+
     emitter.cancel = function cancel() {
-      call.cancel();
+      intercepting_call.cancel();
     };
     emitter.getPeer = function getPeer() {
-      return call.getPeer();
+      return intercepting_call.getPeer();
     };
-    var client_batch = {};
-    var message = serialize(args.argument);
-    if (args.options) {
-      message.grpcWriteFlags = args.options.flags;
-    }
 
-    client_batch[grpc.opType.SEND_INITIAL_METADATA] =
-        metadata._getCoreRepresentation();
-    client_batch[grpc.opType.SEND_MESSAGE] = message;
-    client_batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
-    client_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
-    client_batch[grpc.opType.RECV_MESSAGE] = true;
-    client_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
-    call.startBatch(client_batch, function(err, response) {
-      response.status.metadata = Metadata._fromCoreRepresentation(
-          response.status.metadata);
-      var status = response.status;
-      var error;
-      var deserialized;
-      emitter.emit('metadata', Metadata._fromCoreRepresentation(
-          response.metadata));
-      if (status.code === grpc.status.OK) {
-        if (err) {
-          // Got a batch error, but OK status. Something went wrong
-          args.callback(err);
-          return;
-        } else {
-          try {
-            deserialized = deserialize(response.read);
-          } catch (e) {
-            /* Change status to indicate bad server response. This will result
-             * in passing an error to the callback */
-            status = {
-              code: grpc.status.INTERNAL,
-              details: 'Failed to parse server response'
-            };
-          }
-        }
-      }
-      if (status.code !== grpc.status.OK) {
-        error = new Error(status.details);
-        error.code = status.code;
-        error.metadata = status.metadata;
-        args.callback(error);
-      } else {
-        args.callback(null, deserialized);
-      }
-      emitter.emit('status', status);
-    });
+    intercepting_call.start(metadata);
+    intercepting_call.sendMessage(args.argument);
+    intercepting_call.halfClose();
+
     return emitter;
   }
   return makeUnaryRequest;
@@ -447,13 +783,10 @@ function makeUnaryRequestFunction(method, serialize, deserialize) {
 
 /**
  * Get a function that can make client stream requests to the specified method.
- * @param {string} method The name of the method to request
- * @param {function(*):Buffer} serialize The serialization function for inputs
- * @param {function(Buffer)} deserialize The deserialization function for
- *     outputs
+ * @param {MethodDescriptor} method_descriptor A container of method attributes
  * @return {Function} makeClientStreamRequest
  */
-function makeClientStreamRequestFunction(method, serialize, deserialize) {
+function makeClientStreamRequestFunction(method_descriptor) {
   /**
    * Make a client stream request with this method on the given channel with the
    * given callback, etc.
@@ -472,74 +805,48 @@ function makeClientStreamRequestFunction(method, serialize, deserialize) {
      * object. This allows for simple handling of optional arguments in the
      * middle of the argument list, and also provides type checking. */
     var args = arguejs({metadata: [Metadata, new Metadata()],
-                        options: [Object], callback: Function}, arguments);
-    var call = getCall(this.$channel, method, args.options);
+      options: [Object, {}], callback: Function}, arguments);
+    var constructor_interceptors = this[method_descriptor.name] ?
+      this[method_descriptor.name].interceptors :
+      null;
+    args.options.method_descriptor = method_descriptor;
+    var interceptors = client_interceptors.processInterceptorLayers(
+      args.options,
+      constructor_interceptors,
+      method_descriptor
+    );
+    var call_constructor = getCall.bind(null, this.$channel);
     metadata = args.metadata.clone();
-    var stream = new ClientWritableStream(call, serialize);
-    var metadata_batch = {};
-    metadata_batch[grpc.opType.SEND_INITIAL_METADATA] =
-        metadata._getCoreRepresentation();
-    metadata_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
-    call.startBatch(metadata_batch, function(err, response) {
-      if (err) {
-        // The call has stopped for some reason. A non-OK status will arrive
-        // in the other batch.
-        return;
-      }
-      stream.emit('metadata', Metadata._fromCoreRepresentation(
-          response.metadata));
-    });
-    var client_batch = {};
-    client_batch[grpc.opType.RECV_MESSAGE] = true;
-    client_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
-    call.startBatch(client_batch, function(err, response) {
-      response.status.metadata = Metadata._fromCoreRepresentation(
-          response.status.metadata);
-      var status = response.status;
-      var error;
-      var deserialized;
-      if (status.code === grpc.status.OK) {
-        if (err) {
-          // Got a batch error, but OK status. Something went wrong
-          args.callback(err);
-          return;
-        } else {
-          try {
-            deserialized = deserialize(response.read);
-          } catch (e) {
-            /* Change status to indicate bad server response. This will result
-             * in passing an error to the callback */
-            status = {
-              code: grpc.status.INTERNAL,
-              details: 'Failed to parse server response'
-            };
-          }
-        }
-      }
-      if (status.code !== grpc.status.OK) {
-        error = new Error(response.status.details);
-        error.code = status.code;
-        error.metadata = status.metadata;
-        args.callback(error);
-      } else {
-        args.callback(null, deserialized);
-      }
-      stream.emit('status', status);
-    });
-    return stream;
+
+    var batch_registry = new client_interceptors.BatchRegistry();
+    var intercepting_call = _getInterceptingCall(call_constructor,
+      interceptors, batch_registry, args.options);
+    var emitter = new ClientWritableStream(intercepting_call,
+      method_descriptor.serialize);
+
+    var batch_types = [
+      BatchType.METADATA,
+      BatchType.RECV_SYNC,
+      BatchType.SEND_STREAMING,
+      BatchType.CLOSE
+    ];
+    _registerBatches(emitter, batch_registry, batch_types, args.options,
+      args.callback);
+
+    intercepting_call.start(metadata);
+
+    return emitter;
   }
   return makeClientStreamRequest;
 }
 
 /**
  * Get a function that can make server stream requests to the specified method.
- * @param {string} method The name of the method to request
- * @param {function(*):Buffer} serialize The serialization function for inputs
- * @param {function(Buffer)} deserialize The deserialization function for
- *     outputs
+ * @param {MethodDescriptor} method_descriptor A container of method attributes
+ * creation of the request method
  * @return {Function} makeServerStreamRequest
  */
-function makeServerStreamRequestFunction(method, serialize, deserialize) {
+function makeServerStreamRequestFunction(method_descriptor) {
   /**
    * Make a server stream request with this method on the given channel with the
    * given argument, etc.
@@ -557,41 +864,36 @@ function makeServerStreamRequestFunction(method, serialize, deserialize) {
      * are not used directly. Instead, ArgueJS processes the arguments
      * object. */
     var args = arguejs({argument: null, metadata: [Metadata, new Metadata()],
-                        options: [Object]}, arguments);
-    var call = getCall(this.$channel, method, args.options);
+      options: [Object, {}]}, arguments);
+    var constructor_interceptors = this[method_descriptor.name] ?
+      this[method_descriptor.name].interceptors :
+      null;
+    args.options.method_descriptor = method_descriptor;
+    var interceptors = client_interceptors.processInterceptorLayers(
+      args.options,
+      constructor_interceptors,
+      method_descriptor
+    );
+    var call_constructor = getCall.bind(null, this.$channel);
     metadata = args.metadata.clone();
-    var stream = new ClientReadableStream(call, deserialize);
-    var start_batch = {};
-    var message = serialize(args.argument);
-    if (args.options) {
-      message.grpcWriteFlags = args.options.flags;
-    }
-    start_batch[grpc.opType.SEND_INITIAL_METADATA] =
-        metadata._getCoreRepresentation();
-    start_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
-    start_batch[grpc.opType.SEND_MESSAGE] = message;
-    start_batch[grpc.opType.SEND_CLOSE_FROM_CLIENT] = true;
-    call.startBatch(start_batch, function(err, response) {
-      if (err) {
-        // The call has stopped for some reason. A non-OK status will arrive
-        // in the other batch.
-        return;
-      }
-      stream.emit('metadata', Metadata._fromCoreRepresentation(
-          response.metadata));
-    });
-    var status_batch = {};
-    status_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
-    call.startBatch(status_batch, function(err, response) {
-      if (err) {
-        stream.emit('error', err);
-        return;
-      }
-      response.status.metadata = Metadata._fromCoreRepresentation(
-          response.status.metadata);
-      stream._receiveStatus(response.status);
-    });
-    return stream;
+    var batch_registry = new client_interceptors.BatchRegistry();
+    var intercepting_call = _getInterceptingCall(call_constructor,
+      interceptors, batch_registry, args.options);
+
+    var batch_types = [
+      BatchType.SEND_SYNC,
+      BatchType.STATUS,
+      BatchType.RECV_STREAMING
+    ];
+
+    var emitter = new ClientReadableStream(intercepting_call,
+      method_descriptor.deserialize);
+    _registerBatches(emitter, batch_registry, batch_types, args.options,
+      args.callback);
+    intercepting_call.start(metadata);
+    intercepting_call.sendMessage(args.argument);
+    intercepting_call.halfClose();
+    return emitter;
   }
   return makeServerStreamRequest;
 }
@@ -599,13 +901,13 @@ function makeServerStreamRequestFunction(method, serialize, deserialize) {
 /**
  * Get a function that can make bidirectional stream requests to the specified
  * method.
- * @param {string} method The name of the method to request
- * @param {function(*):Buffer} serialize The serialization function for inputs
- * @param {function(Buffer)} deserialize The deserialization function for
- *     outputs
+ * @param {MethodDescriptor} method_descriptor A container of method attributes
+ * @param {grpc.Client} [client] A client object to attach the function to
+ * @param {Function[]} [method_interceptors] Interceptors provided during
+ * creation of the request method
  * @return {Function} makeBidiStreamRequest
  */
-function makeBidiStreamRequestFunction(method, serialize, deserialize) {
+function makeBidiStreamRequestFunction(method_descriptor) {
   /**
    * Make a bidirectional stream request with this method on the given channel.
    * @this {SurfaceClient} Client object. Must have a channel member.
@@ -620,35 +922,36 @@ function makeBidiStreamRequestFunction(method, serialize, deserialize) {
      * are not used directly. Instead, ArgueJS processes the arguments
      * object. */
     var args = arguejs({metadata: [Metadata, new Metadata()],
-                        options: [Object]}, arguments);
-    var call = getCall(this.$channel, method, args.options);
+      options: [Object, {}]}, arguments);
+    var constructor_interceptors = this[method_descriptor.name] ?
+      this[method_descriptor.name].interceptors :
+      null;
+    args.options.method_descriptor = method_descriptor;
+    var interceptors = client_interceptors.processInterceptorLayers(
+      args.options,
+      constructor_interceptors,
+      method_descriptor
+    );
+    var call_constructor = getCall.bind(null, this.$channel);
     metadata = args.metadata.clone();
-    var stream = new ClientDuplexStream(call, serialize, deserialize);
-    var start_batch = {};
-    start_batch[grpc.opType.SEND_INITIAL_METADATA] =
-        metadata._getCoreRepresentation();
-    start_batch[grpc.opType.RECV_INITIAL_METADATA] = true;
-    call.startBatch(start_batch, function(err, response) {
-      if (err) {
-        // The call has stopped for some reason. A non-OK status will arrive
-        // in the other batch.
-        return;
-      }
-      stream.emit('metadata', Metadata._fromCoreRepresentation(
-          response.metadata));
-    });
-    var status_batch = {};
-    status_batch[grpc.opType.RECV_STATUS_ON_CLIENT] = true;
-    call.startBatch(status_batch, function(err, response) {
-      if (err) {
-        stream.emit('error', err);
-        return;
-      }
-      response.status.metadata = Metadata._fromCoreRepresentation(
-          response.status.metadata);
-      stream._receiveStatus(response.status);
-    });
-    return stream;
+    var batch_registry = new client_interceptors.BatchRegistry();
+    var intercepting_call = _getInterceptingCall(call_constructor,
+      interceptors, batch_registry, args.options);
+
+    var batch_types = [
+      BatchType.METADATA,
+      BatchType.STATUS,
+      BatchType.SEND_STREAMING,
+      BatchType.RECV_STREAMING,
+      BatchType.CLOSE
+    ];
+
+    var emitter = new ClientDuplexStream(intercepting_call,
+      method_descriptor.serialize, method_descriptor.deserialize);
+    _registerBatches(emitter, batch_registry, batch_types, args.options,
+      args.callback);
+    intercepting_call.start(metadata);
+    return emitter;
   }
   return makeBidiStreamRequest;
 }
@@ -658,12 +961,11 @@ function makeBidiStreamRequestFunction(method, serialize, deserialize) {
  * Map with short names for each of the requester maker functions. Used in
  * makeClientConstructor
  */
-var requester_makers = {
-  unary: makeUnaryRequestFunction,
-  server_stream: makeServerStreamRequestFunction,
-  client_stream: makeClientStreamRequestFunction,
-  bidi: makeBidiStreamRequestFunction
-};
+var requester_makers = {};
+requester_makers[MethodType.UNARY] = makeUnaryRequestFunction;
+requester_makers[MethodType.CLIENT_STREAMING] = makeClientStreamRequestFunction;
+requester_makers[MethodType.SERVER_STREAMING] = makeServerStreamRequestFunction;
+requester_makers[MethodType.BIDI_STREAMING] = makeBidiStreamRequestFunction;
 
 function getDefaultValues(metadata, options) {
   var res = {};
@@ -683,7 +985,7 @@ var deprecated_request_wrap = {
       /* jshint validthis: true */
       var opt_args = getDefaultValues(metadata, metadata);
       return makeUnaryRequest.call(this, argument, opt_args.metadata,
-                                   opt_args.options, callback);
+        opt_args.options, callback);
     };
   },
   client_stream: function(makeServerStreamRequest) {
@@ -692,12 +994,21 @@ var deprecated_request_wrap = {
       /* jshint validthis: true */
       var opt_args = getDefaultValues(metadata, options);
       return makeServerStreamRequest.call(this, opt_args.metadata,
-                                          opt_args.options, callback);
+        opt_args.options, callback);
     };
   },
   server_stream: _.identity,
   bidi: _.identity
 };
+
+exports.InterceptorProvider = function(get_interceptor) {
+  this.get_interceptor = get_interceptor;
+};
+
+exports.InterceptorProvider.prototype.getInterceptorForMethod =
+  function(method_descriptor) {
+    return this.get_interceptor(method_descriptor);
+  };
 
 /**
  * Creates a constructor for a client with the given methods. The methods object
@@ -732,6 +1043,7 @@ exports.makeClientConstructor = function(methods, serviceName,
    * @param {Object} options Options to pass to the underlying channel
    */
   function Client(address, credentials, options) {
+    var self = this;
     if (!options) {
       options = {};
     }
@@ -744,11 +1056,28 @@ exports.makeClientConstructor = function(methods, serviceName,
       options['grpc.primary_user_agent'] = '';
     }
     options['grpc.primary_user_agent'] += 'grpc-node/' + version;
+
+    /* Resolve interceptor options and assign interceptors to each method */
+    var interceptor_providers = options.interceptor_providers || [];
+    delete options.interceptor_providers;
+    var interceptors = options.interceptors || [];
+    delete options.interceptors;
+    if (interceptor_providers.length && interceptors.length) {
+      throw new client_interceptors.InterceptorConfigurationError(
+        'Both interceptors and interceptor_providers were passed as options ' +
+        'to the client constructor. Only one of these is allowed.');
+    }
+    _.each(self.$method_descriptors, function(method_descriptor) {
+      self[method_descriptor.name].interceptors = client_interceptors
+        .resolveInterceptorProviders(interceptor_providers, method_descriptor)
+        .concat(interceptors);
+    });
+
     /* Private fields use $ as a prefix instead of _ because it is an invalid
      * prefix of a method name */
-    this.$channel = new grpc.Channel(address, credentials, options);
-  }
+    self.$channel = new grpc.Channel(address, credentials, options);
 
+  }
   _.each(methods, function(attrs, name) {
     var method_type;
     if (_.startsWith(name, '$')) {
@@ -756,26 +1085,36 @@ exports.makeClientConstructor = function(methods, serviceName,
     }
     if (attrs.requestStream) {
       if (attrs.responseStream) {
-        method_type = 'bidi';
+        method_type = MethodType.BIDI_STREAMING;
       } else {
-        method_type = 'client_stream';
+        method_type = MethodType.CLIENT_STREAMING;
       }
     } else {
       if (attrs.responseStream) {
-        method_type = 'server_stream';
+        method_type = MethodType.SERVER_STREAMING;
       } else {
-        method_type = 'unary';
+        method_type = MethodType.UNARY;
       }
     }
-    var serialize = attrs.requestSerialize;
-    var deserialize = attrs.responseDeserialize;
-    var method_func = requester_makers[method_type](
-        attrs.path, serialize, deserialize);
+    var serialize = attrs.requestStream ?
+      common.wrapIgnoreNull(attrs.requestSerialize) :
+      attrs.requestSerialize;
+    var deserialize = attrs.responseStream ?
+      common.wrapIgnoreNull(attrs.responseDeserialize) :
+      attrs.responseDeserialize;
+    var service_name = attrs.path.split('/')[1];
+    var method_descriptor = new MethodDescriptor(name, service_name, attrs.path,
+      method_type, serialize, deserialize);
+    var method_func = requester_makers[method_type](method_descriptor);
     if (class_options.deprecatedArgumentOrder) {
       Client.prototype[name] = deprecated_request_wrap(method_func);
     } else {
       Client.prototype[name] = method_func;
     }
+    if (!_.isArray(Client.prototype.$method_descriptors)) {
+      Client.prototype.$method_descriptors = [];
+    }
+    Client.prototype.$method_descriptors.push(method_descriptor);
     // Associate all provided attributes with the method
     _.assign(Client.prototype[name], attrs);
   });
@@ -790,6 +1129,18 @@ exports.makeClientConstructor = function(methods, serviceName,
  */
 exports.getClientChannel = function(client) {
   return client.$channel;
+};
+
+/**
+ * Gets a map of client methods to interceptor arrays
+ * @param {object} client
+ * @returns {object}
+ */
+exports.getClientInterceptors = function(client) {
+  return _.mapValues(_.keyBy(client.$method_descriptors, 'name'),
+    function(d, name) {
+      return client[name].interceptors;
+    });
 };
 
 /**
@@ -832,8 +1183,8 @@ exports.waitForClientReady = function(client, deadline, callback) {
 exports.makeProtobufClientConstructor =  function(service, options) {
   var method_attrs = common.getProtobufServiceAttrs(service, options);
   var deprecatedArgumentOrder = false;
-  if (options) {
-    deprecatedArgumentOrder = options.deprecatedArgumentOrder;
+  if (!options) {
+    options = {deprecatedArgumentOrder: false};
   }
   var Client = exports.makeClientConstructor(
       method_attrs, common.fullyQualifiedName(service),
@@ -852,3 +1203,9 @@ exports.status = grpc.status;
  * See docs for client.callError
  */
 exports.callError = grpc.callError;
+
+exports.StatusBuilder = client_interceptors.StatusBuilder;
+exports.ListenerBuilder = client_interceptors.ListenerBuilder;
+exports.RequesterBuilder = client_interceptors.RequesterBuilder;
+exports.InterceptingCall = client_interceptors.InterceptingCall;
+exports.DelegatingListener = client_interceptors.DelegatingListener;
